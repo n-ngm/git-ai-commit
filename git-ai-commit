@@ -1,0 +1,162 @@
+#!/bin/bash -eu
+
+usage() {
+  echo "Usage: git-ai-commit [OPTIONS]"
+  echo ""
+  echo "Generate git commit message from staged diff using GhatGPT."
+  echo "Options:"
+  echo "  --api-key API_KEY    OpenAI API key (default: \$OPENAI_API_KEY environmental variable)"
+  echo "  --model MODEL        OpenAI model (default: gpt-4o-mini)"
+  echo "  --temperature TEMP   OpenAI Temperature for sampling (default: 0.7)"
+  echo "  --lang LANG          Language for output (default: \$LANG environmental variable else en-US)"
+  echo "  --body-lines NUMBER  Number of lines for body (default: 0 = none)"
+  echo "  --non-interactive    Do not prompt for confirmation (default: no)"
+  echo "  --help               Show this help message"
+}
+
+# require curl, jq
+if ! command -v curl >/dev/null; then
+  echo "curl command is required. please install curl." >&2
+  exit 1
+fi
+if ! command -v jq >/dev/null; then
+  echo "jq command is required. please install jq." >&2
+  exit 1
+fi
+
+# set options
+OPTION_LANG=""
+OPTION_BODY_LINES=""
+OPTION_INTERACTIVE=""
+OPTION_GIT_COMMIT=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --api-key)
+      OPENAI_API_KEY=$2
+      shift 2
+      ;;
+    --model)
+      OPTION_MODEL=$2
+      shift 2
+      ;;
+    --temperature)
+      OPTION_TEMPERATURE=$2
+      shift 2
+      ;;
+    --lang)
+      OPTION_LANG=$2
+      shift 2
+      ;;
+    --body-lines)
+      OPTION_BODY_LINES=$2
+      shift 2
+      ;;
+    --non-interactive)
+      OPTION_INTERACTIVE='none'
+      shift 2
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      OPTION_GIT_COMMIT+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "OpenAI_API_key is required. Please set OPENAI_API_KEY environmental variable or use -k option." >&2
+  exit 1
+fi
+PROMPT_LANG="output must be in lang: ${OPTION_LANG:-${LANG:-en-US}}"
+
+PROMPT_BODY=""
+if [ ! -z "${OPTION_BODY_LINES:-}" ]; then
+  PROMPT_BODY="add description, in under ${OPTION_BODY_LINES} bullet points, open empty line before description."
+fi
+
+# get diff
+if ! git status >/dev/null ; then
+  exit 1
+fi
+
+GIT_DIFF=$(git diff --staged)
+if [ -z "$GIT_DIFF" ]; then
+  echo "No changes to commit. git add some changes and try again."
+  exit 1
+fi
+
+# query gpt
+query_gpt() {
+  # prompt for ai
+  PROMPT=$(cat <<EOL
+generate git commit message from below diff. focus on changes, summarize changes with appropriate length, in one sentence,
+must follow format: <type>: <subject>
+  type const: feat, fix, docs, style, refactor, test, chore
+${PROMPT_LANG}
+${PROMPT_BODY}
+--
+${GIT_DIFF}
+--
+EOL
+)
+
+  QUERY=$(jq -n --arg content "$PROMPT" '{"role": "user", "content": $content}')
+
+  # generate commit message
+  # remove quotes
+  ANSWER=$(curl https://api.openai.com/v1/chat/completions -s \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+    -d "{\"model\": \"${OPTION_MODEL:-gpt-4o-mini}\",
+         \"temperature\": ${OPTION_TEMPERATURE:-0.7},
+         \"max_tokens\": 1000,
+         \"messages\": [${QUERY}]}")
+
+  if [ -z "${ANSWER:-}" ]; then
+    echo "Failed to get response from OpenAI API." >&2
+    exit 1
+  fi
+
+  if [ "$(echo "$ANSWER" | jq -e 'has("error")')" = "true" ]; then
+    echo "$ANSWER" | jq -r '.error.message' >&2
+    exit 1
+  fi
+
+  echo "$ANSWER" | jq -r '.choices[0].message.content'
+}
+
+MESSAGE=$(query_gpt)
+
+if [ ! -z "$OPTION_INTERACTIVE" ]; then
+  if [ ${#OPTION_GIT_COMMIT[@]} -eq 0 ]; then
+    git commit -m "$MESSAGE"
+  else
+    git commit -m "$MESSAGE" "${OPTION_GIT_COMMIT[@]}"
+  fi
+  exit 0
+fi
+
+echo "$MESSAGE" >&2
+while true; do
+  read -p "OK ? [y/n/q]: " CONFIRM
+  case "$CONFIRM" in
+    n)
+      MESSAGE=$(query_gpt)
+      echo "$MESSAGE" >&2
+      ;;
+    q)
+      break
+      ;;
+    *)
+      if [ ${#OPTION_GIT_COMMIT[@]} -eq 0 ]; then
+        git commit -m "$MESSAGE"
+      else
+        git commit -m "$MESSAGE" "${OPTION_GIT_COMMIT[@]}"
+      fi
+      break
+      ;;
+  esac
+done
